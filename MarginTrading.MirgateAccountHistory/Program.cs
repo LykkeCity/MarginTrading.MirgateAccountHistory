@@ -29,27 +29,8 @@ namespace MarginTrading.MirgateAccountHistory
                 var programDemo = new Program(config.DemoHistoryDbConnectionString, "DEMO");
                 var programLive = new Program(config.LiveHistoryDbConnectionString, "LIVE");
 
-                Console.WriteLine("Press any key to start");
-                Console.ReadKey();
-
-                Console.WriteLine("If you wish to make a cleanup of previous unseccessful run - press 'c'. Otherwise - any other letter.");
-                if (Console.ReadKey().KeyChar == 'c')
-                {
-                    Console.WriteLine();
-                    Console.WriteLine("Cleaning up...");
-                    await Task.WhenAll(programDemo.RunCleanup(), programLive.RunCleanup());
-                }
-
-                Console.WriteLine();
                 Console.WriteLine("Converting..");
                 await Task.WhenAll(programDemo.RunConvert(), programLive.RunConvert());
-
-                while (Console.ReadKey().KeyChar != 'd')
-                    Console.WriteLine("Generate new entities finished, press 'd' to delete old ones");
-
-                Console.WriteLine();
-                Console.WriteLine("Removing old..");
-                await Task.WhenAll(programDemo.RunRemoveOldEntities(), programLive.RunRemoveOldEntities());
             }
             catch (Exception e)
             {
@@ -66,7 +47,8 @@ namespace MarginTrading.MirgateAccountHistory
         private readonly Stopwatch _clock = Stopwatch.StartNew();
         private readonly string _envName;
         private readonly MarginTradingAccountHistoryRepository _repository;
-        private readonly MarginTradingAccountHistoryRepository _backup;
+        private readonly MarginTradingAccountHistoryRepository _repository2;
+        private readonly MarginTradingAccountHistoryRepository _repository3;
 
         private Program(string connection, string envName)
         {
@@ -77,57 +59,36 @@ namespace MarginTrading.MirgateAccountHistory
             _repository = new MarginTradingAccountHistoryRepository(
                 AzureTableStorage<MarginTradingAccountHistoryEntity>.Create(
                     connectionString,
-                    "MarginTradingAccountsHistory", new EmptyLog()));
-            _backup = new MarginTradingAccountHistoryRepository(AzureTableStorage<MarginTradingAccountHistoryEntity>.Create(
-                connectionString,
-                "MarginTradingAccountsHistoryBkp", _log));
-        }
-
-        private async Task RunCleanup()
-        {
-            _clock.Restart();
-            await _repository.BatchDelete(new TableQuery<MarginTradingAccountHistoryEntity>()
-                .Where(TableQuery.GenerateFilterConditionForInt("EntityVersion", QueryComparisons.Equal, 2)));
-            Log("Cleanup unnecessary data finished");
+                    "MarginTradingAccountsHistory", _log));
+            _repository2 = new MarginTradingAccountHistoryRepository(
+                AzureTableStorage<MarginTradingAccountHistoryEntity>.Create(
+                    connectionString,
+                    "AccountsHistory", new EmptyLog()));
+            _repository3 = new MarginTradingAccountHistoryRepository(
+                AzureTableStorage<MarginTradingAccountHistoryEntity>.Create(
+                    connectionString,
+                    "MarginTradingAccountsHistoryOld", _log));
         }
 
         private async Task RunConvert()
         {
             _clock.Restart();
-            await ProcessOperation(e => e.EntityVersion != 2,
-                batch => Task.WhenAll(_repository.AddWithDateKeyBatchAsync(batch),
-                    _backup.InsertOrReplaceBatchAsync(batch)));
+            await ProcessOperation(batch => Task.WhenAll(_repository2.AddWithDateKeyBatchAsync(batch), _repository3.Insert(batch)));
             Log("Convert finished");
         }
 
-        private async Task RunRemoveOldEntities()
-        {
-            _clock.Restart();
-            await ProcessOperation(e => e.EntityVersion != 2,
-                batch => _repository.DeleteAsync(batch));
-            Log("RemoveOldEntities finished");
-        }
-
-        private async Task ProcessOperation(
-            Func<MarginTradingAccountHistoryEntity, bool> filter,
-            Func<IReadOnlyList<MarginTradingAccountHistoryEntity>, Task> operation)
+        private async Task ProcessOperation(Func<IReadOnlyList<MarginTradingAccountHistoryEntity>, Task> operation)
         {
             var errorTcs = new TaskCompletionSource<object>();
             var dataflow = DataflowFluent
                 .ReceiveDataOfType<IReadOnlyList<MarginTradingAccountHistoryEntity>>()
-                .TransformMany(batch =>
-                    batch.Where(filter).GroupBy(p => p.PartitionKey, (k, gr) => gr.ToList()))
+                .TransformMany(batch => batch.GroupBy(p => p.PartitionKey, (k, gr) => gr.ToList()))
                 .ProcessAsync(operation)
                 .WithMaxDegreeOfParallelism(10)
                 .Action(batch =>
                 {
-                    int currCounterValue;
-                    int oldCounterValue;
-                    //lock (_counterLock)
-                    {
-                        oldCounterValue = _counter;
-                        currCounterValue = _counter += batch.Count;
-                    }
+                    var oldCounterValue = _counter;
+                    var currCounterValue = _counter += batch.Count;
                     if (currCounterValue / 1000 != oldCounterValue / 1000)
                     {
                         Log($"Completed: {currCounterValue}; elapsed: {_clock.Elapsed}, speed: {currCounterValue / _clock.Elapsed.TotalMinutes:f2}/min");
@@ -144,12 +105,13 @@ namespace MarginTrading.MirgateAccountHistory
 
             dataflow.Start();
 
-            await _repository.ExecuteWithPaginationAsync(
+            await _repository.Read(
                 new TableQuery<MarginTradingAccountHistoryEntity>().Select(MarginTradingAccountHistoryEntity.ColumnNames),
                 entities => dataflow.SendAsync(entities));
             await dataflow.CompleteAsync();
             errorTcs.TrySetResult(null);
             await errorTcs.Task;
+            Log($"Fin. Completed: {_counter}; elapsed: {_clock.Elapsed}, speed: {_counter / _clock.Elapsed.TotalMinutes:f2}/min");
         }
 
         private void Log(string str)
